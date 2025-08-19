@@ -1,0 +1,25 @@
+{
+  "name": "gemini-code-api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare",
+    "db:generate": "drizzle-kit generate:sqlite",
+    "db:migrate": "wrangler d1 migrations apply gemini-code --remote",
+    "deploy:pages": "wrangler pages deploy dist --project-name gemini-code-api --commit-dirty"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.4.3",
+    "drizzle-orm": "^0.29.3",
+    "nuxt": "^3.9.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.10",
+    "drizzle-kit": "^0.20.13",
+    "wrangler": "^4.0.0"
+  }
+}
