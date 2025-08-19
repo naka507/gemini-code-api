@@ -32,6 +32,7 @@ function json(obj: unknown): string {
 // -----------------------------
 
 const MODEL_MAP: Record<string, string> = {
+	'claude-3-7-sonnet-20250219': 'gemini-2.5-flash',
 	'claude-sonnet-4-20250514': 'gemini-2.5-flash',
 	'claude-opus-4-20250514': 'gemini-2.5-pro',
 };

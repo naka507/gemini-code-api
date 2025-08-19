@@ -110,172 +110,167 @@ export default defineEventHandler(async (event) => {
       return createError({ statusCode: 401, statusMessage: 'API key not provided.' });
     }
     
-    // 确保包含必需的 Anthropic API 头部
-    const requestHeaders = {
-      ...getHeaders(event),
-      'Authorization': `Bearer ${selectedKey}`,
-      'x-api-key': selectedKey,
-      'anthropic-version': '2023-06-01'  // 添加必需的版本头
-    };
-    
     const request = new Request(getRequestURL(event).toString(), {
       method: getMethod(event),
-      headers: requestHeaders,
+      headers: {
+        ...getHeaders(event),
+        'x-api-key': selectedKey
+      },
       body: JSON.stringify(requestBody)
     });
     
     const response = await claudeHandler.fetch(request, event.context.cloudflare?.env);
     
-    // 设置必需的 Anthropic API 响应头
-    const responseHeaders: Record<string, string> = {
-      'Content-Type': response.headers.get('Content-Type') || 'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version',
-      'request-id': response.headers.get('request-id') || `req_${randomUUID()}`,
-      'anthropic-version': '2023-06-01'
-    };
-    
-    // 如果是流式响应，添加流式响应头
-    if (requestBody.stream) {
-      responseHeaders['Cache-Control'] = 'no-cache';
-      responseHeaders['Connection'] = 'keep-alive';
-      responseHeaders['X-Accel-Buffering'] = 'no';
-    }
-    
-    setHeaders(event, responseHeaders);
-    
-    const isStream = !!requestBody.stream;
-    let responseText = '';
-    let inputTokens = null;
-    let outputTokens = null;
-    
-    // 对于非流式响应，先读取内容以提取token信息
-    if (!isStream && response.ok && response.body) {
-      try {
-        responseText = await response.text();
-        const responseData = JSON.parse(responseText);
-        
-        // 提取token信息
-        if (responseData.usage) {
-          inputTokens = responseData.usage.input_tokens || null;
-          outputTokens = responseData.usage.output_tokens || null;
-        }
-      } catch (e) {
-        console.warn('Failed to parse Claude response for token extraction:', e);
-      }
-    } else if (isStream && response.ok && response.body) {
-      // 对于流式响应，解析SSE数据以提取token信息
-      try {
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        const chunks: Uint8Array[] = [];
-        
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+    if (response.headers.get('content-type')?.includes('text/event-stream')) {
+      // Streaming response - extract tokens while preserving stream
+      let inputTokens = 0;
+      let outputTokens = 0;
+      
+      const stream = new ReadableStream({
+        async start(controller) {
+          const reader = response.body!.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
           
-          chunks.push(value);
-          buffer += decoder.decode(value, { stream: true });
-        }
-        
-        // 解析message_delta事件以提取token信息
-        const lines = buffer.split('\n');
-        for (const line of lines) {
-          if (line.startsWith('data: ') && line.includes('message_delta')) {
+          const pump = async (): Promise<void> => {
             try {
-              const data = JSON.parse(line.substring(6));
-              if (data.type === 'message_delta' && data.usage) {
-                outputTokens = data.usage.output_tokens || null;
+              const { done, value } = await reader.read();
+              
+              if (done) {
+                // Log request when stream completes
+                try {
+                  const d1 = (event as any).context?.cloudflare?.env?.DB;
+                  if (d1) {
+                    const db = getDb(d1);
+                    const ip = getHeader(event, 'cf-connecting-ip') || getHeader(event, 'x-forwarded-for') || '127.0.0.1';
+                    const apiKeyHash = createHash('sha256').update(selectedKey).digest('hex');
+                    const clientModel = requestBody.model || 'claude-3-sonnet-20240229';
+                    
+                    const MODEL_MAP: Record<string, string> = {
+                       'claude-3-7-sonnet-20250219': 'gemini-2.5-flash',
+                       'claude-sonnet-4-20250514': 'gemini-2.5-flash',
+                       'claude-opus-4-20250514': 'gemini-2.5-pro',
+                     };
+                    const actualGeminiModel = MODEL_MAP[clientModel] || 'gemini-2.0-flash';
+                    
+                    const logEntry = {
+                      id: randomUUID(),
+                      apiKeyHash,
+                      model: actualGeminiModel,
+                      ipAddress: ip,
+                      statusCode: response.status,
+                      requestTimestamp: new Date(startTime).toISOString(),
+                      responseTimeMs: Date.now() - startTime,
+                      isStream: true,
+                      userAgent: getHeader(event, 'user-agent') || 'unknown',
+                      errorMessage: undefined as any,
+                      requestUrl: event.node.req.url,
+                      requestModel: clientModel,
+                      inputTokens,
+                      outputTokens,
+                    };
+                    await db.insert(requestLogs).values(logEntry as any).execute();
+                  }
+                } catch (error) {
+                  console.warn('Failed to log Claude request:', error.message);
+                }
+                controller.close();
+                return;
               }
-            } catch (e) {
-              // 继续查找下一行
-            }
-          } else if (line.startsWith('data: ') && line.includes('message_start')) {
-            try {
-              const data = JSON.parse(line.substring(6));
-              if (data.type === 'message_start' && data.message && data.message.usage) {
-                inputTokens = data.message.usage.input_tokens || null;
+              
+              // Forward chunk immediately
+              controller.enqueue(value);
+              
+              // Accumulate for token extraction
+              buffer += decoder.decode(value, { stream: true });
+              
+              // Parse for token information
+              const lines = buffer.split('\n');
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  try {
+                    const data = JSON.parse(line.slice(6));
+                    if (data.type === 'message_start' && data.message?.usage) {
+                      inputTokens = data.message.usage.input_tokens || 0;
+                    }
+                    if (data.type === 'message_delta' && data.usage) {
+                      outputTokens = data.usage.output_tokens || 0;
+                    }
+                  } catch {}
+                }
               }
-            } catch (e) {
-              // 继续查找下一行
+              
+              return pump();
+            } catch (error) {
+              controller.error(error);
             }
-          }
+          };
+          
+          await pump();
         }
-        
-        // 重新创建响应体
-        response = new Response(new ReadableStream({
-          start(controller) {
-            for (const chunk of chunks) {
-              controller.enqueue(chunk);
-            }
-            controller.close();
-          }
-        }), {
-          status: response.status,
-          statusText: response.statusText,
-          headers: response.headers
-        });
-      } catch (e) {
-        console.warn('Failed to parse Claude streaming response for token extraction:', e);
+      });
+      
+      // Set response headers for streaming
+      setResponseStatus(event, response.status);
+      for (const [key, value] of response.headers.entries()) {
+        setHeaders(event, { [key]: value });
       }
-    }
-    
-    // 添加日志记录
-    try {
-      const d1 = (event as any).context?.cloudflare?.env?.DB;
-      if (d1) {
-        const db = getDb(d1);
-        const ip = getHeader(event, 'cf-connecting-ip') || getHeader(event, 'x-forwarded-for') || '127.0.0.1';
-        const apiKeyHash = createHash('sha256').update(selectedKey).digest('hex');
-        const clientModel = requestBody.model || 'claude-3-sonnet-20240229';
-        
-        // 获取映射后的实际Gemini模型名称
-        const MODEL_MAP: Record<string, string> = {
-          'claude-sonnet-4-20250514': 'gemini-2.5-flash',
-          'claude-opus-4-20250514': 'gemini-2.5-pro',
-        };
-        const actualGeminiModel = MODEL_MAP[clientModel] || 'gemini-2.0-flash';
-        
-        const logEntry = {
-          id: randomUUID(),
-          apiKeyHash,
-          model: actualGeminiModel, // 记录实际的Gemini模型
-          ipAddress: ip,
-          statusCode: response.status,
-          requestTimestamp: new Date(startTime).toISOString(),
-          responseTimeMs: Date.now() - startTime,
-          isStream,
-          userAgent: getHeader(event, 'user-agent') || 'unknown',
-          errorMessage: undefined as any,
-          requestUrl: event.node.req.url,
-          requestModel: clientModel, // 记录客户端提交的模型
-          inputTokens,
-          outputTokens,
-        };
-        // fire-and-forget
-        await db.insert(requestLogs).values(logEntry as any).execute();
-      }
-    } catch (error) {
-      // Silently ignore logging errors in development
-      console.warn('Failed to log Claude request:', error.message);
-    }
-    
-    // 正确处理响应体
-    if (response.body) {
-      // 对于流式响应，使用 sendStream 处理
-      if (isStream) {
-        setResponseStatus(event, response.status);
-        return sendStream(event, response.body);
-      } else {
-        // 对于非流式响应，返回已读取的文本
-        setResponseStatus(event, response.status);
-        return responseText || await response.text();
-      }
+      
+      return sendStream(event, stream);
     } else {
-      setResponseStatus(event, response.status || 500);
-      return { error: 'No response body from Claude handler' };
+      // Non-streaming response
+      const responseText = await response.text();
+      let inputTokens = 0;
+      let outputTokens = 0;
+      
+      try {
+        const responseData = JSON.parse(responseText);
+        inputTokens = responseData.usage?.input_tokens || 0;
+        outputTokens = responseData.usage?.output_tokens || 0;
+      } catch {}
+      
+      // 添加日志记录
+      try {
+        const d1 = (event as any).context?.cloudflare?.env?.DB;
+        if (d1) {
+          const db = getDb(d1);
+          const ip = getHeader(event, 'cf-connecting-ip') || getHeader(event, 'x-forwarded-for') || '127.0.0.1';
+          const apiKeyHash = createHash('sha256').update(selectedKey).digest('hex');
+          const clientModel = requestBody.model || 'claude-3-sonnet-20240229';
+          
+          const MODEL_MAP: Record<string, string> = {
+             'claude-3-7-sonnet-20250219': 'gemini-2.5-flash',
+             'claude-sonnet-4-20250514': 'gemini-2.5-flash',
+             'claude-opus-4-20250514': 'gemini-2.5-pro',
+           };
+          const actualGeminiModel = MODEL_MAP[clientModel] || 'gemini-2.0-flash';
+          
+          const logEntry = {
+            id: randomUUID(),
+            apiKeyHash,
+            model: actualGeminiModel,
+            ipAddress: ip,
+            statusCode: response.status,
+            requestTimestamp: new Date(startTime).toISOString(),
+            responseTimeMs: Date.now() - startTime,
+            isStream: false,
+            userAgent: getHeader(event, 'user-agent') || 'unknown',
+            errorMessage: undefined as any,
+            requestUrl: event.node.req.url,
+            requestModel: clientModel,
+            inputTokens,
+            outputTokens,
+          };
+          await db.insert(requestLogs).values(logEntry as any).execute();
+        }
+      } catch (error) {
+        console.warn('Failed to log Claude request:', error.message);
+      }
+      
+      return new Response(responseText, {
+        status: response.status,
+        headers: response.headers
+      });
     }
   }
 
@@ -337,50 +332,55 @@ export default defineEventHandler(async (event) => {
         console.warn('Failed to parse OpenAI response for token extraction:', e);
       }
     } else if (isStream && response.ok && response.body) {
-      // 对于流式响应，解析SSE数据以提取token信息
-      try {
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        const chunks: Uint8Array[] = [];
-        
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+      // 对于流式响应，使用Transform流来提取token信息而不中断流式传输
+      const decoder = new TextDecoder();
+      let buffer = '';
+      
+      responseBody = new ReadableStream({
+        start(controller) {
+          const reader = response.body!.getReader();
           
-          chunks.push(value);
-          buffer += decoder.decode(value, { stream: true });
-        }
-        
-        // 解析最后的chunk以提取token信息
-        const lines = buffer.split('\n').reverse();
-        for (const line of lines) {
-          if (line.startsWith('data: ') && !line.includes('[DONE]')) {
-            try {
-              const data = JSON.parse(line.substring(6));
-              if (data.usage) {
-                inputTokens = data.usage.prompt_tokens || null;
-                outputTokens = data.usage.completion_tokens || null;
-                break;
+          function pump(): Promise<void> {
+            return reader.read().then(({ done, value }) => {
+              if (done) {
+                // 在流结束时尝试提取token信息
+                try {
+                  const lines = buffer.split('\n').reverse();
+                  for (const line of lines) {
+                    if (line.startsWith('data: ') && !line.includes('[DONE]')) {
+                      try {
+                        const data = JSON.parse(line.substring(6));
+                        if (data.usage) {
+                          inputTokens = data.usage.prompt_tokens || null;
+                          outputTokens = data.usage.completion_tokens || null;
+                          break;
+                        }
+                      } catch (e) {
+                        // 继续查找下一行
+                      }
+                    }
+                  }
+                } catch (e) {
+                  console.warn('Failed to extract tokens from OpenAI stream:', e);
+                }
+                controller.close();
+                return;
               }
-            } catch (e) {
-              // 继续查找下一行
-            }
+              
+              // 累积数据用于token提取
+              buffer += decoder.decode(value, { stream: true });
+              
+              // 立即转发数据块给客户端
+              controller.enqueue(value);
+              return pump();
+            }).catch(err => {
+              controller.error(err);
+            });
           }
+          
+          return pump();
         }
-        
-        // 重新创建响应体
-        responseBody = new ReadableStream({
-          start(controller) {
-            for (const chunk of chunks) {
-              controller.enqueue(chunk);
-            }
-            controller.close();
-          }
-        });
-      } catch (e) {
-        console.warn('Failed to parse OpenAI streaming response for token extraction:', e);
-      }
+      });
     }
     
     // 添加日志记录

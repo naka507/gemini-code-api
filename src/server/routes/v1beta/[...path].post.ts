@@ -1,5 +1,5 @@
 // src/server/routes/v1beta/[...path].post.ts
-import type { H3Event } from 'h3';
+import { H3Event, sendStream, getHeader, getHeaders, getMethod, getRequestURL, getQuery, getRouterParam, readBody, setHeaders, setResponseStatus, createError, defineEventHandler } from 'h3';
 import { getDb } from '~/utils/db';
 import { requestLogs } from '~/utils/db/schema';
 import { createHash, randomUUID } from 'node:crypto';
@@ -47,92 +47,146 @@ export default defineEventHandler(async (event) => {
   });
 
   const contentType = geminiResponse.headers.get('Content-Type') || 'application/json';
-  const responseHeaders = new Headers({ 'Content-Type': contentType });
   const isStream = contentType.includes('text/event-stream');
   
   // 获取真实的模型名称
   const realModel = originalPath.split('/')[1]?.split(':')[0] || 'unknown';
   
-  // 读取响应内容以提取token信息
-  let responseBody = geminiResponse.body;
   let inputTokens = null;
   let outputTokens = null;
   
-  if (geminiResponse.ok) {
-    try {
-      const responseText = await geminiResponse.text();
-      
-      if (isStream) {
-        // 处理流式响应，解析SSE数据
-        const lines = responseText.split('\n');
-        for (const line of lines.reverse()) { // 从后往前查找usageMetadata
-          if (line.startsWith('data: ')) {
-            try {
-              const jsonStr = line.substring(6).trim();
-              if (jsonStr && jsonStr !== '[DONE]') {
-                const data = JSON.parse(jsonStr);
-                if (data.usageMetadata && data.usageMetadata.candidatesTokenCount) {
-                  inputTokens = data.usageMetadata.promptTokenCount || null;
-                  outputTokens = data.usageMetadata.candidatesTokenCount || null;
-                  break;
-                }
+  if (isStream) {
+    // 流式响应处理
+    const stream = new ReadableStream({
+      async start(controller) {
+        const reader = geminiResponse.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        
+        const pump = async (): Promise<void> => {
+          try {
+            const { done, value } = await reader.read();
+            
+            if (done) {
+              // Log request when stream completes
+              try {
+                const d1 = (event as any).context.cloudflare.env.DB;
+                const db = getDb(d1);
+                const ip = getHeader(event, 'cf-connecting-ip') || getHeader(event, 'x-forwarded-for');
+                const apiKeyHash = createHash('sha256').update(selectedKey).digest('hex');
+                
+                const logEntry = {
+                  id: randomUUID(),
+                  apiKeyHash,
+                  model: realModel,
+                  ipAddress: ip,
+                  statusCode: geminiResponse.status,
+                  requestTimestamp: new Date(startTime).toISOString(),
+                  responseTimeMs: Date.now() - startTime,
+                  isStream: true,
+                  userAgent: getHeader(event, 'user-agent'),
+                  errorMessage: undefined as any,
+                  requestUrl: event.node.req.url,
+                  requestModel: realModel,
+                  inputTokens,
+                  outputTokens,
+                };
+                await db.insert(requestLogs).values(logEntry as any).execute();
+              } catch (e) {
+                console.warn('Failed to log request:', e);
               }
-            } catch (e) {
-              // 忽略解析错误，继续查找
+              controller.close();
+              return;
             }
+            
+            // Forward chunk immediately
+            controller.enqueue(value);
+            
+            // Accumulate for token extraction
+            buffer += decoder.decode(value, { stream: true });
+            
+            // Parse for token information
+            const lines = buffer.split('\n');
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                try {
+                  const jsonStr = line.substring(6).trim();
+                  if (jsonStr && jsonStr !== '[DONE]') {
+                    const data = JSON.parse(jsonStr);
+                    if (data.usageMetadata) {
+                      inputTokens = data.usageMetadata.promptTokenCount || null;
+                      outputTokens = data.usageMetadata.candidatesTokenCount || null;
+                    }
+                  }
+                } catch {}
+              }
+            }
+            
+            return pump();
+          } catch (error) {
+            controller.error(error);
           }
-        }
-      } else {
-        // 处理非流式响应
-        const responseData = JSON.parse(responseText);
-        if (responseData.usageMetadata) {
-          inputTokens = responseData.usageMetadata.promptTokenCount || null;
-          outputTokens = responseData.usageMetadata.candidatesTokenCount || null;
-        }
+        };
+        
+        await pump();
       }
-      
-      // 重新创建响应体
-      responseBody = new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode(responseText));
-          controller.close();
-        }
-      });
-    } catch (e) {
-      // 如果解析失败，保持原始响应体
-      console.warn('Failed to parse response for token extraction:', e);
-    }
-  }
-
-  // Log entry
-  try {
-    const d1 = (event as any).context.cloudflare.env.DB;
-    const db = getDb(d1);
-    const ip = getHeader(event, 'cf-connecting-ip') || getHeader(event, 'x-forwarded-for');
-    const apiKeyHash = createHash('sha256').update(selectedKey).digest('hex');
+    });
     
-    const logEntry = {
-      id: randomUUID(),
-      apiKeyHash,
-      model: realModel,
-      ipAddress: ip,
-      statusCode: geminiResponse.status,
-      requestTimestamp: new Date(startTime).toISOString(),
-      responseTimeMs: Date.now() - startTime,
-      isStream,
-      userAgent: getHeader(event, 'user-agent'),
-      errorMessage: undefined as any,
-      requestUrl: event.node.req.url,
-      requestModel: realModel,
-      inputTokens,
-      outputTokens,
-    };
-    await db.insert(requestLogs).values(logEntry as any).execute();
-  } catch (e) {
-    console.warn('Failed to log request:', e);
+    // Set response headers for streaming
+    setResponseStatus(event, geminiResponse.status);
+    for (const [key, value] of geminiResponse.headers.entries()) {
+      setHeaders(event, { [key]: value });
+    }
+    
+    return sendStream(event, stream);
+  } else {
+    // 非流式响应处理
+    const responseText = await geminiResponse.text();
+    
+    try {
+      const responseData = JSON.parse(responseText);
+      if (responseData.usageMetadata) {
+        inputTokens = responseData.usageMetadata.promptTokenCount || null;
+        outputTokens = responseData.usageMetadata.candidatesTokenCount || null;
+      }
+    } catch (e) {
+       console.warn('Failed to parse response for token extraction:', e);
+     }
+     
+     // Log entry for non-streaming
+     try {
+       const d1 = (event as any).context.cloudflare.env.DB;
+       const db = getDb(d1);
+       const ip = getHeader(event, 'cf-connecting-ip') || getHeader(event, 'x-forwarded-for');
+       const apiKeyHash = createHash('sha256').update(selectedKey).digest('hex');
+       
+       const logEntry = {
+         id: randomUUID(),
+         apiKeyHash,
+         model: realModel,
+         ipAddress: ip,
+         statusCode: geminiResponse.status,
+         requestTimestamp: new Date(startTime).toISOString(),
+         responseTimeMs: Date.now() - startTime,
+         isStream: false,
+         userAgent: getHeader(event, 'user-agent'),
+         errorMessage: undefined as any,
+         requestUrl: event.node.req.url,
+         requestModel: realModel,
+         inputTokens,
+         outputTokens,
+       };
+       await db.insert(requestLogs).values(logEntry as any).execute();
+     } catch (e) {
+       console.warn('Failed to log request:', e);
+     }
+     
+     return new Response(responseText, { 
+       status: geminiResponse.status, 
+       statusText: geminiResponse.statusText, 
+       headers: geminiResponse.headers 
+     });
   }
-
-  return new Response(responseBody, { status: geminiResponse.status, statusText: geminiResponse.statusText, headers: responseHeaders });
 });
 
 
